@@ -3057,6 +3057,17 @@ button.x:disabled {
   margin: 0 1px;
 }
 
+/* The WebHID connect button once the puck is connected: disabled, as there is
+   nothing left to do, but a status to read, so not dimmed like a dead control. */
+button.puckconnected:disabled {
+  opacity: 1;
+}
+
+.puckcheck {
+  font-weight: 700;
+  color: var(--green);
+}
+
 /* The SpaceMouse's reversed axes: six switches, each lit while reversed. */
 .setting.puckaxes-row > span {
   align-self: start;

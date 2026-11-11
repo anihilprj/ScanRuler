@@ -4,7 +4,9 @@
 // pans, zooms, turns and rolls the main view the way the part should follow
 // the hand, shows its settings only once attached and reverses an axis from
 // them, holds the wheel off while it moves, and passes from the 3D view hidden
-// behind the 2D workspace to the sheet and back.
+// behind the 2D workspace to the sheet and back. Then the same puck as Chrome
+// on Linux sees it, never as a gamepad: a stand-in behind navigator.hid,
+// connected from the settings and flown from its raw reports.
 //
 // Prereqs: dev server running (npm run dev), Chrome installed. Reads the
 // camera through the development hook, window.__scanruler.
@@ -106,27 +108,33 @@ await page.evaluate(() => {
 await sleep(250)
 check(dist((await camera()).pos, start.pos) < 1e-9, 'a puck the browser has not reported is not read')
 
-const puckSettings = async () => {
-  await click(page, '[data-test="open-settings"]')
-  await page.waitForSelector('[data-test="settings-modal"]')
-  const shown = await page.evaluate(() => {
-    const el = document.querySelector('[data-test="spacemouse-status"]')
-    return el ? el.textContent : null
-  })
-  return shown
+/** Open the settings: whether the puck's own settings show, and what its
+ *  status says. Where the browser offers WebHID — headless Chrome does — the
+ *  status is on the connect button; elsewhere it is the line under the speed. */
+const puckSettingsOf = async (p) => {
+  await click(p, '[data-test="open-settings"]')
+  await p.waitForSelector('[data-test="settings-modal"]')
+  return p.evaluate(() => ({
+    shown: Boolean(document.querySelector('[data-test="spacemouse-settings"]')),
+    status: (
+      document.querySelector('[data-test="spacemouse-webhid-connect"]') ??
+      document.querySelector('[data-test="spacemouse-status"]')
+    )?.textContent ?? null,
+  }))
 }
+const puckSettings = () => puckSettingsOf(page)
 const closeSettings = async () => {
   await page.keyboard.press('Escape')
   await page.waitForFunction(() => !document.querySelector('[data-test="settings-modal"]'))
 }
-check((await puckSettings()) === null, 'no SpaceMouse settings before a puck has attached')
+check(!(await puckSettings()).shown, 'no SpaceMouse settings before a puck has attached')
 await closeSettings()
 
 await touch()
 await sleep(50)
 check(connected.length === 1, `the puck connects on its first touch (${connected[0] ?? 'no message'})`)
-const status = await puckSettings()
-check(/Connected: SpaceMouse Compact/.test(status ?? ''), `the SpaceMouse settings show once it attaches (${status})`)
+const { shown, status } = await puckSettings()
+check(shown && /Connected: SpaceMouse Compact/.test(status ?? ''), `the SpaceMouse settings show once it attaches (${status})`)
 await closeSettings()
 await page.mouse.move(...mid)
 
@@ -286,5 +294,99 @@ check(dist((await camera()).pos, before.pos) < 1e-9 && dist(await otherPosition(
   'both ScanRuler windows stay still when an unrelated page has focus')
 await external.close()
 await other.close()
+
+// ---- a puck Chrome never shows as a gamepad, read through WebHID ------------
+// As on Linux: no gamepad at all, and a stand-in WebHID device sending the
+// Compact's reports — 1 the slides, 2 the turns, three int16 each, ±350. The
+// page has no grant at first, so nothing is read until the button is used.
+const hidPage = await browser.newPage()
+hidPage.on('console', (m) => {
+  if (m.type() === 'error') consoleErrors.push(m.text())
+})
+await hidPage.evaluateOnNewDocument(() => {
+  Object.defineProperty(navigator, 'getGamepads', { configurable: true, value: () => [null, null, null, null] })
+  const axis = { logicalMinimum: -350, logicalMaximum: 350, reportCount: 3, reportSize: 16 }
+  const dev = Object.assign(new EventTarget(), {
+    vendorId: 0x256f,
+    productId: 0xc635,
+    productName: 'SpaceMouse Compact',
+    opened: false,
+    collections: [{ usagePage: 1, usage: 8, inputReports: [{ reportId: 1, items: [axis] }, { reportId: 2, items: [axis] }] }],
+    async open() { dev.opened = true },
+    async close() { dev.opened = false },
+  })
+  const hid = Object.assign(new EventTarget(), {
+    getDevices: async () => [],
+    requestDevice: async () => [dev],
+  })
+  Object.defineProperty(navigator, 'hid', { configurable: true, value: hid })
+  window.__hidSend = (reportId, values) => {
+    const data = new DataView(new ArrayBuffer(values.length * 2))
+    values.forEach((v, i) => data.setInt16(2 * i, v, true))
+    dev.dispatchEvent(Object.assign(new Event('inputreport'), { reportId, data, device: dev }))
+  }
+  window.__hidUnplug = () => hid.dispatchEvent(Object.assign(new Event('disconnect'), { device: dev }))
+})
+await hidPage.goto(APP_URL, { waitUntil: 'networkidle0' })
+await hidPage.waitForSelector('.panel')
+await loadScan(hidPage, STL)
+await hidPage.bringToFront()
+await hidPage.waitForFunction(() => document.hasFocus())
+
+const hidCamera = () =>
+  hidPage.evaluate(() => {
+    const cam = window.__scanruler.scene().viewport.camera
+    cam.updateMatrixWorld()
+    return {
+      pos: cam.position.toArray(),
+      right: cam.position.clone().setFromMatrixColumn(cam.matrixWorld, 0).toArray(),
+    }
+  })
+/** Hold the cap slid right for `ms`, reporting as a real puck does while
+ *  deflected, then let go: a few zero reports. */
+const hidSlide = async (ms = 300) => {
+  const until = Date.now() + ms
+  while (Date.now() < until) {
+    await hidPage.evaluate(() => window.__hidSend(1, [350, 0, 0]))
+    await sleep(16)
+  }
+  for (let i = 0; i < 3; i++) await hidPage.evaluate(() => window.__hidSend(1, [0, 0, 0]))
+  await sleep(120)
+}
+const hidRect = await canvasRect(hidPage)
+const hidMid = [hidRect.x + hidRect.w / 2, hidRect.y + hidRect.h / 2]
+await hidPage.mouse.move(...hidMid)
+
+before = await hidCamera()
+await hidSlide()
+check(dist((await hidCamera()).pos, before.pos) < 1e-9, 'a WebHID puck the page was not let use is not read')
+let hidState = await puckSettingsOf(hidPage)
+check(hidState.status === 'Connect via WebHID', `without a gamepad the settings offer WebHID (${hidState.status})`)
+await click(hidPage, '[data-test="spacemouse-webhid-connect"]')
+await hidPage.waitForFunction(() =>
+  /Connected: SpaceMouse Compact/.test(document.querySelector('[data-test="spacemouse-webhid-connect"]')?.textContent ?? ''),
+)
+hidState = { status: await hidPage.$eval('[data-test="spacemouse-webhid-connect"]', (b) => `${b.disabled}:${b.textContent}`) }
+check(/^true:✓ Connected: SpaceMouse Compact$/.test(hidState.status), `connected, the button stays as its status (${hidState.status})`)
+await hidPage.keyboard.press('Escape')
+await hidPage.waitForFunction(() => !document.querySelector('[data-test="settings-modal"]'))
+await hidPage.mouse.move(...hidMid)
+
+before = await hidCamera()
+await hidSlide()
+after = await hidCamera()
+const hidMoved = after.pos.map((v, i) => v - before.pos[i])
+check(dist(hidMoved, [0, 0, 0]) > 1, `the WebHID puck pans the view (${dist(hidMoved, [0, 0, 0]).toFixed(1)} mm)`)
+check(dot(hidMoved, before.right) < 0, 'through WebHID too, a slide to the right moves the camera left')
+await sleep(200)
+before = await hidCamera()
+await sleep(300)
+check(dist((await hidCamera()).pos, before.pos) < 1e-9, 'let go, the WebHID puck stops the view')
+
+await hidPage.evaluate(() => window.__hidUnplug())
+hidState = await puckSettingsOf(hidPage)
+check(hidState.status === 'Connect via WebHID', `unplugged, the settings offer WebHID again (${hidState.status})`)
+await hidPage.keyboard.press('Escape')
+await hidPage.close()
 
 await finish(browser, consoleErrors)

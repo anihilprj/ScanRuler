@@ -390,6 +390,31 @@ the first touch connects it. With several viewports on screen, the split view
 or the two halves of the point picker, the puck drives the one the mouse was
 last over. On a flat 2D sheet it pans and zooms and does not turn.
 
+**On Linux** Chrome often never shows the puck as a gamepad, however it is
+touched: the kernel gives it only relative axes and makes no joystick device
+for it. There **⚙ Settings → Navigation → Connect via WebHID** reads it
+instead, straight from the device: pick the SpaceMouse in the browser's list,
+and the button turns into **✓ Connected** with its name. Everything else is
+the same. Two things to know:
+
+- The browser may open the puck only with a udev rule that gives the
+  logged-in user access to it. Without one, connecting fails with a note
+  about the rule. As root, create
+  `/etc/udev/rules.d/70-spacemouse-hidraw.rules` with the one line
+
+  ```
+  KERNEL=="hidraw*", ATTRS{idVendor}=="256f", TAG+="uaccess"
+  ```
+
+  then run `udevadm control --reload-rules && udevadm trigger` and plug the
+  puck in again. `256f` is 3Dconnexion's vendor id; an older puck sold
+  under Logitech's name has `046d`, and a second line with that id covers
+  it.
+- A puck without a serial number, the SpaceMouse Compact among them, has to
+  be connected again with the button each time it is plugged back in or the
+  browser restarted: Chrome cannot tell it is the same device, so it does
+  not keep the permission.
+
 ### Settings
 
 **⚙ Settings** in the top bar holds what is set once and left, all of it

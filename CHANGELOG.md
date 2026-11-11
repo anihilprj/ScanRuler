@@ -7,6 +7,19 @@ saves carry the same number as `appVersion`. How a release is cut is in
 
 ## Unreleased
 
+- **A SpaceMouse on Linux** (2026-11-11). Chrome on Linux often never shows
+  a SpaceMouse as a gamepad: the kernel gives the puck only relative axes,
+  so it makes no joystick device for it, and the puck did nothing. Where
+  that happens, the puck can now be read through WebHID instead:
+  **Connect via WebHID** in the settings, under Navigation, asks for it
+  once, and the button then shows it as connected. A puck without a serial
+  number, such as the SpaceMouse Compact, has to be connected there again
+  after it is plugged back in, as Chrome cannot tell it is the same one.
+  Linux needs a udev rule before the browser may open the puck; the manual
+  gives it. Motion, speed, reversed axes and the choice of view are the
+  same as through the Gamepad API, which is still used wherever the
+  browser offers it.
+
 - **Right-click menus on list rows** (2026-11-10, pull request 131). A
   right click on an element, dimension or tolerance row opens a menu with
   Edit, Hide or Show in viewport and Delete, and on a dimension or

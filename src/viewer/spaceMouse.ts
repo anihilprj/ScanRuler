@@ -30,6 +30,13 @@
 // turn or slide of the cap is the camera's going the other way, and the
 // operator's hand the part's. That is the 3Dconnexion default, and the one
 // the reports from real pucks (issue #10) asked for.
+//
+// On Linux Chrome often never shows a puck as a gamepad: the kernel gives it
+// only relative axes, so no joystick device is made for it. There the puck is
+// read through WebHID instead, from its raw reports, once the operator has let
+// this page use it (the browser remembers that). The axes come in the same
+// order and the same sense as through the Gamepad API, so everything past the
+// shared buffer is one path. A puck seen as a gamepad is read as one.
 
 /** One frame of puck motion, as the camera is to move. Each axis is in
  *  [-speed, speed] (see SpaceMouseTuning), 0 inside the deadzone. */
@@ -120,6 +127,23 @@ let lastRead = 0
 let driver: object | null = null
 /** Each axis's factor, speed and direction together. */
 let gain: Record<SpaceMouseAxisId, number> = { tx: -1, ty: 1, tz: 1, rx: -1, ry: 1, rz: 1 }
+/** The puck's six raw axes, each in [-1, 1], in SPACE_MOUSE_AXES order. The
+ *  one place motion is read from, whichever way the device delivers it: the
+ *  Gamepad API is polled into it on each read, while a source that pushes its
+ *  reports as events can write into it as they come. */
+const axes: number[] = [0, 0, 0, 0, 0, 0]
+/** The puck read through WebHID, from the moment it is claimed, null for none. */
+let hid: HIDDevice | null = null
+/** Its name, set once it is open and reporting; null until then. */
+let hidId: string | null = null
+/** Each input report's full scale, by report id, from the device's descriptor. */
+let hidScale = new Map<number, number>()
+/** performance.now() of the last WebHID motion report. */
+let lastReport = 0
+/** A puck sends reports while it is deflected and a few zero ones when let go.
+ *  Should those be lost, the buffer would hold the last deflection and the view
+ *  would keep flying; past this long without a report, it is taken as at rest. */
+const HID_STALE_MS = 1000
 /** Told when a puck attaches or goes. */
 const watchers = new Set<() => void>()
 
@@ -136,14 +160,163 @@ export function watchSpaceMouse(fn: () => void): () => void {
   return () => watchers.delete(fn)
 }
 
-/** The attached puck's name as the browser gives it, null for none. */
+/** The gamepad puck's name as the browser gives it, null for none. */
 let attachedId: string | null = null
+/** The attached puck's name, the one being read; null for none. */
 export function spaceMouseName(): string | null {
-  return attachedId
+  return attachedId ?? hidId
 }
 
 const changed = (): void => {
   for (const fn of watchers) fn()
+}
+
+/** Copy the attached gamepad's axes into the buffer; false when there is
+ *  none to read. Only called once the page and the viewport are known to want
+ *  motion, so a background window never polls the device. */
+const pullGamepad = (): boolean => {
+  const gp = navigator.getGamepads()[index]
+  if (!gp?.connected) return false
+  for (let i = 0; i < axes.length; i++) axes[i] = gp.axes[i] ?? 0
+  return true
+}
+
+/** Whether the WebHID puck has anything to read; its reports are already in
+ *  the buffer. */
+const hidReady = (now: number): boolean => {
+  if (hidId === null) return false
+  if (now - lastReport > HID_STALE_MS) axes.fill(0)
+  return true
+}
+
+const hex4 = (n: number): string => n.toString(16).padStart(4, '0')
+
+/** The device named as Chrome names a gamepad, so one pattern matches both. */
+const hidIdOf = (d: HIDDevice): string =>
+  `${d.productName} (Vendor: ${hex4(d.vendorId)} Product: ${hex4(d.productId)})`
+
+/** A puck offers more than one interface (on some, a keyboard for the
+ *  buttons); the axes are on the multi-axis controller: usage page 1, usage 8. */
+const isMultiAxis = (d: HIDDevice): boolean =>
+  d.collections.some((c) => c.usagePage === 1 && c.usage === 8)
+
+/** Each input report's full scale: the largest logical extent among its items.
+ *  Read from the device rather than fixed, as pucks differ (±350 on the
+ *  Compact, other ranges on others). */
+function reportScales(collections: readonly HIDCollectionInfo[], into = new Map<number, number>()): Map<number, number> {
+  for (const c of collections) {
+    for (const r of c.inputReports ?? []) {
+      let scale = 0
+      for (const it of r.items ?? []) {
+        scale = Math.max(scale, Math.abs(it.logicalMaximum ?? 0), Math.abs(it.logicalMinimum ?? 0))
+      }
+      if (scale > 0) into.set(r.reportId ?? 0, scale)
+    }
+    reportScales(c.children ?? [], into)
+  }
+  return into
+}
+
+/** Report 1 carries the slides and report 2 the turns, three little-endian
+ *  int16 each. A puck that sends all six in one report puts them in report 1,
+ *  which the byte count then covers. Others (the buttons) are not motion. */
+const onHidReport = (e: HIDInputReportEvent): void => {
+  const first = e.reportId === 1 ? 0 : e.reportId === 2 ? 3 : -1
+  const scale = hidScale.get(e.reportId)
+  if (first === -1 || !scale) return
+  const n = Math.min(axes.length - first, Math.floor(e.data.byteLength / 2))
+  for (let i = 0; i < n; i++) {
+    axes[first + i] = Math.max(-1, Math.min(1, e.data.getInt16(2 * i, true) / scale))
+  }
+  lastReport = performance.now()
+}
+
+/** Open a device the page may use and read it, if it is a puck and none is
+ *  read through WebHID yet. */
+async function attachHid(d: HIDDevice): Promise<boolean> {
+  if (hid) return hid === d
+  if (!isMultiAxis(d) || !isSpaceMouse(hidIdOf(d))) return false
+  // Claimed before the await, so a second call while this one opens skips it.
+  hid = d
+  try {
+    if (!d.opened) await d.open()
+  } catch (err) {
+    hid = null
+    throw err
+  }
+  hidScale = reportScales(d.collections)
+  axes.fill(0)
+  lastReport = performance.now()
+  d.addEventListener('inputreport', onHidReport)
+  hidId = hidIdOf(d)
+  // Debug, not info: the settings dialog already says so, and the console stays
+  // quiet at its default levels.
+  console.debug(`SpaceMouse connected via WebHID: ${hidId}`)
+  changed()
+  return true
+}
+
+const UDEV_HINT = 'SpaceMouse found but could not be opened; on Linux it needs a udev rule (see the docs).'
+
+/** Unasked, nobody is waiting on the outcome, so a failure only goes to the
+ *  console. */
+const attachQuietly = (d: HIDDevice): Promise<boolean> =>
+  attachHid(d).catch((err: unknown) => {
+    console.warn(UDEV_HINT, err)
+    return false
+  })
+
+/** Read the first puck among the devices the page was already let use. */
+async function findHid(api: HID): Promise<void> {
+  for (const d of await api.getDevices()) await attachQuietly(d)
+}
+
+/** Whether this browser can be asked for a puck through WebHID. */
+export function spaceMouseHidAvailable(): boolean {
+  return typeof navigator !== 'undefined' && !!navigator.hid
+}
+
+/** How asking for a puck ended. */
+export type SpaceMouseHidResult = 'connected' | 'cancelled' | 'failed'
+
+/** The browser's device chooser, narrowed to multi-axis controllers from the
+ *  two vendors SPACE_MOUSE_ID knows. */
+const HID_FILTERS: HIDDeviceFilter[] = [0x256f, 0x046d].map((vendorId) => ({ vendorId, usagePage: 1, usage: 8 }))
+
+/** Ask the operator for a puck and read it. Must be called from a click or a
+ *  key press: the browser shows its chooser only for one. The grant may not
+ *  outlast the plug (a puck without a serial number cannot be recognised when
+ *  it comes back), so this is how a replugged puck is taken up again. */
+export async function connectSpaceMouseHid(): Promise<SpaceMouseHidResult> {
+  const api = navigator.hid
+  if (!api) return 'failed'
+  // The disconnect handling must be in place even if no viewport has started
+  // listening yet.
+  listenForSpaceMouse()
+  try {
+    // Before any other await, while the click still counts as the gesture.
+    const picked = await api.requestDevice({ filters: HID_FILTERS })
+    for (const d of picked) if (await attachHid(d)) return 'connected'
+    return 'cancelled'
+  } catch (err) {
+    console.warn(UDEV_HINT, err)
+    return 'failed'
+  }
+}
+
+function listenForHid(api: HID): void {
+  // A device the page was let use before, plugged in again.
+  api.addEventListener('connect', (e) => void attachQuietly(e.device))
+  api.addEventListener('disconnect', (e) => {
+    if (e.device !== hid) return
+    hid.removeEventListener('inputreport', onHidReport)
+    hid = null
+    hidId = null
+    axes.fill(0)
+    changed()
+    void findHid(api)
+  })
+  void findHid(api)
 }
 
 const resetMotionClock = (): void => {
@@ -156,11 +329,15 @@ const pageActive = (): boolean => document.visibilityState === 'visible' && docu
 /** Start watching for a puck. Called by every viewport; only the first call
  *  does anything. */
 export function listenForSpaceMouse(): void {
-  if (listening || typeof window === 'undefined' || !('getGamepads' in navigator)) return
+  if (listening || typeof window === 'undefined') return
+  const hidApi = navigator.hid
+  if (!('getGamepads' in navigator) && !hidApi) return
   listening = true
   window.addEventListener('blur', resetMotionClock)
   window.addEventListener('focus', resetMotionClock)
   document.addEventListener('visibilitychange', resetMotionClock)
+  if (hidApi) listenForHid(hidApi)
+  if (!('getGamepads' in navigator)) return
   const attach = (gp: Gamepad | null): void => {
     if (index !== -1 || !gp?.connected || !isSpaceMouse(gp.id)) return
     index = gp.index
@@ -176,6 +353,9 @@ export function listenForSpaceMouse(): void {
     if (e.gamepad.index !== index) return
     index = -1
     attachedId = null
+    // The buffer holds the gamepad's last axes; a WebHID puck taking over must
+    // not fly on them until its own next report.
+    axes.fill(0)
     // A second puck already on this page takes over.
     for (const gp of navigator.getGamepads()) attach(gp)
     if (index === -1) changed()
@@ -184,7 +364,7 @@ export function listenForSpaceMouse(): void {
 
 /** Whether a puck is attached: the frame loop's one check. */
 export function spaceMouseAttached(): boolean {
-  return index !== -1
+  return index !== -1 || hidId !== null
 }
 
 /** Point the puck at this viewport: the mouse is over it, or it has just
@@ -218,10 +398,9 @@ export function readSpaceMouse(owner: object, showing: boolean): SpaceMouseMotio
   const now = performance.now()
   const dt = Math.min((now - lastRead) / 1000, 0.1)
   lastRead = now
-  const gp = navigator.getGamepads()[index]
-  if (!gp?.connected || dt <= 0) return null
-  const ax = gp.axes
-  const read = (a: SpaceMouseAxisId): number => spaceMouseAxis(ax[RAW[a].at]) * gain[a] || 0
+  const ready = index !== -1 ? pullGamepad() : hidReady(now)
+  if (!ready || dt <= 0) return null
+  const read = (a: SpaceMouseAxisId): number => spaceMouseAxis(axes[RAW[a].at]) * gain[a] || 0
   const m: SpaceMouseMotion = {
     dt,
     tx: read('tx'),

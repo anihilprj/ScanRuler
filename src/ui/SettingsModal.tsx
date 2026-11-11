@@ -24,6 +24,8 @@ import {
   SPACE_MOUSE_SPEED_MAX,
   SPACE_MOUSE_SPEED_MIN,
   SPACE_MOUSE_SPEED_STEP,
+  connectSpaceMouseHid,
+  spaceMouseHidAvailable,
   spaceMouseName,
   watchSpaceMouse,
   type SpaceMouseAxisId,
@@ -137,6 +139,7 @@ export function SettingsModal() {
   const setPuckSpeed = usePrefs((s) => s.setSpaceMouseSpeed)
   const puckReverse = usePrefs((s) => s.spaceMouseReverse)
   const setPuckReversed = usePrefs((s) => s.setSpaceMouseReversed)
+  const [hidFailed, setHidFailed] = useState(false)
 
   // Escape closes it. Captured, like the imprint's, so the workspace's own
   // Escape handling — which would discard the draft behind the dialog — never
@@ -147,6 +150,8 @@ export function SettingsModal() {
   const scheme = schemeById(navScheme)
   const theme = themeById(viewTheme)
   const map = colormapById(colormap)
+  // Where WebHID is offered, its row says whether the puck is connected.
+  const hidRow = spaceMouseHidAvailable()
   return (
     <div className="modalback" onClick={() => close(false)}>
       <div
@@ -320,6 +325,45 @@ export function SettingsModal() {
             the first time you touch it, and drives the view the mouse was last over.
           </small>
         </div>
+        {hidRow && (
+          <div className="setting" data-test="spacemouse-webhid">
+            <span>SpaceMouse</span>
+            {/* Kept in place once connected, so the row says what it did
+                rather than vanishing from under the pointer. */}
+            <button
+              type="button"
+              data-test="spacemouse-webhid-connect"
+              className={puck !== null ? 'puckconnected' : undefined}
+              disabled={puck !== null}
+              onClick={() => {
+                setHidFailed(false)
+                void connectSpaceMouseHid().then((r) => setHidFailed(r === 'failed'))
+              }}
+            >
+              {puck !== null ? (
+                <>
+                  <span className="puckcheck" aria-hidden="true">✓</span> Connected:{' '}
+                  {puck.replace(/\s*\(.*\)$/, '')}
+                </>
+              ) : (
+                'Connect via WebHID'
+              )}
+            </button>
+            <small>
+              If touching the puck does not connect it, as often on Linux, connect it here; again
+              after plugging it back in.
+              {hidFailed && (
+                <>
+                  {' '}
+                  <b data-test="spacemouse-webhid-failed">
+                    The browser could not open it. On Linux it needs a udev rule to reach the puck —
+                    see the docs.
+                  </b>
+                </>
+              )}
+            </small>
+          </div>
+        )}
         {(puck !== null || puckSeen) && (
           <>
             <div className="setting" data-test="spacemouse-settings">
@@ -337,15 +381,17 @@ export function SettingsModal() {
                 />
                 <output htmlFor="puckspeed">{puckSpeed.toFixed(2)}×</output>
               </div>
-              <small data-test="spacemouse-status">
-                {puck !== null ? (
-                  <>
-                    Connected: <b>{puck.replace(/\s*\(.*\)$/, '')}</b>.
-                  </>
-                ) : (
-                  <>Not connected — touch the puck to connect it.</>
-                )}
-              </small>
+              {!hidRow && (
+                <small data-test="spacemouse-status">
+                  {puck !== null ? (
+                    <>
+                      Connected: <b>{puck.replace(/\s*\(.*\)$/, '')}</b>.
+                    </>
+                  ) : (
+                    <>Not connected — touch the puck to connect it.</>
+                  )}
+                </small>
+              )}
             </div>
             <div className="setting puckaxes-row">
               <span>Reverse</span>

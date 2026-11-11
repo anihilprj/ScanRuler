@@ -172,7 +172,8 @@ files, projects and agent answers stay in millimetres.
   (`0` iso, `1` top, `3` front …). The button above the axis gizmo fits the
   part back into view. **⚙ Settings → Mouse controls** switches to the mouse
   scheme of your CAD tool. A 3Dconnexion **SpaceMouse** works in Chrome and
-  Edge, and touch screens work too. SpaceMouse navigation only affects a
+  Edge (on Linux connect it once in the settings, see the manual), and touch
+  screens work too. SpaceMouse navigation only affects a
   visible, focused ScanRuler page; switching to another window stops background
   motion. Save your work and reload existing tabs after updating.
 - **View bar** (bottom left): show or hide the scan, reference and elements,

@@ -301,6 +301,295 @@ describe('SpaceMouse routing', () => {
   })
 })
 
+describe('SpaceMouse through WebHID', () => {
+  const COMPACT_ID = 'SpaceMouse Compact (Vendor: 256f Product: c635)'
+  let now = 1000
+  let focused: boolean
+  let pads: (Gamepad | null)[]
+  let listeners: Record<string, ((e: { gamepad: Gamepad }) => void)[]>
+  let hidListeners: Record<string, ((e: { device: FakeDevice }) => void)[]>
+  /** What getDevices() answers: the devices the page was already let use. */
+  let granted: FakeDevice[]
+  /** What the browser's chooser hands back: [] when the operator cancels. */
+  let picked: FakeDevice[]
+  let requestDevice: ReturnType<typeof vi.fn>
+  let warn: ReturnType<typeof vi.spyOn>
+  let sm: typeof import('../src/viewer/spaceMouse')
+
+  /** A stand-in for the SpaceMouse Compact as Chrome's WebHID shows it: report
+   *  1 the slides and report 2 the turns, three int16 each, ±`range`. */
+  const compact = (range = 350) => {
+    const onReport: ((e: HIDInputReportEvent) => void)[] = []
+    const axis = { logicalMinimum: -range, logicalMaximum: range, reportCount: 3, reportSize: 16 }
+    const d = {
+      vendorId: 0x256f,
+      productId: 0xc635,
+      productName: 'SpaceMouse Compact',
+      opened: false,
+      openFails: false,
+      collections: [
+        {
+          usagePage: 1,
+          usage: 8,
+          inputReports: [
+            { reportId: 1, items: [axis] },
+            { reportId: 2, items: [axis] },
+            { reportId: 3, items: [{ logicalMinimum: 0, logicalMaximum: 1, reportCount: 2, reportSize: 1 }] },
+          ],
+        },
+      ],
+      open: vi.fn(async (): Promise<void> => {
+        if (d.openFails) throw new Error('NotAllowedError: Failed to open the device.')
+        d.opened = true
+      }),
+      close: async (): Promise<void> => {},
+      addEventListener: (_type: string, l: (e: HIDInputReportEvent) => void): void => {
+        onReport.push(l)
+      },
+      removeEventListener: (_type: string, l: (e: HIDInputReportEvent) => void): void => {
+        onReport.splice(onReport.indexOf(l), 1)
+      },
+      /** Send one input report, the values as the device's own integers. */
+      send(reportId: number, ...values: number[]): void {
+        const data = new DataView(new ArrayBuffer(values.length * 2))
+        values.forEach((v, i) => data.setInt16(2 * i, v, true))
+        for (const l of [...onReport]) l({ reportId, data, device: d } as unknown as HIDInputReportEvent)
+      },
+      reportListeners: () => onReport.length,
+    }
+    return d
+  }
+  type FakeDevice = ReturnType<typeof compact>
+
+  const fire = (type: string, gamepad: object) => {
+    for (const l of listeners[type] ?? []) l({ gamepad: gamepad as Gamepad })
+  }
+  const fireHid = (type: string, device: FakeDevice) => {
+    for (const l of hidListeners[type] ?? []) l({ device })
+  }
+  const tick = (ms = 16) => {
+    now += ms
+  }
+  /** Let the device's open() and the other awaits run. */
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  beforeEach(async () => {
+    now = 1000
+    focused = true
+    listeners = {}
+    hidListeners = {}
+    pads = [null, null]
+    granted = []
+    picked = []
+    requestDevice = vi.fn(async () => picked)
+    vi.stubGlobal('window', {
+      addEventListener: (type: string, l: (e: { gamepad: Gamepad }) => void) => {
+        ;(listeners[type] ??= []).push(l)
+      },
+    })
+    vi.stubGlobal('navigator', {
+      getGamepads: () => pads,
+      hid: {
+        getDevices: async () => granted,
+        requestDevice,
+        addEventListener: (type: string, l: (e: { device: FakeDevice }) => void) => {
+          ;(hidListeners[type] ??= []).push(l)
+        },
+      },
+    })
+    vi.stubGlobal('document', {
+      hasFocus: () => focused,
+      visibilityState: 'visible',
+      addEventListener: () => {},
+    })
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    vi.spyOn(console, 'info').mockImplementation(() => {})
+    vi.spyOn(console, 'debug').mockImplementation(() => {})
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    vi.resetModules()
+    sm = await import('../src/viewer/spaceMouse')
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it('reads a puck the page was already let use, without asking', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    expect(sm.spaceMouseAttached()).toBe(true)
+    expect(sm.spaceMouseName()).toBe(COMPACT_ID)
+    expect(dev.open).toHaveBeenCalledOnce()
+    expect(requestDevice).not.toHaveBeenCalled()
+  })
+
+  it('puts report 1 into the slides and report 2 into the turns, the same as a gamepad', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    const view = {}
+    // The gamepad routing test's [0, 1, 0, 0, -1, 0.5], as the device sends it.
+    dev.send(1, 0, 350, 0)
+    dev.send(2, 0, -350, 175)
+    // The buttons are not motion.
+    dev.send(3, 1)
+    tick()
+    const m = sm.readSpaceMouse(view, true)!
+    expect(m.ty).toBe(1)
+    expect(m.ry).toBe(-1)
+    expect(m.rz).toBeGreaterThan(0)
+    expect([m.tx, m.tz, m.rx]).toEqual([0, 0, 0])
+  })
+
+  it('scales by the range the device declares, not a fixed one', async () => {
+    const dev = compact(1000)
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    dev.send(1, 0, 500, 0)
+    tick()
+    expect(sm.readSpaceMouse({}, true)!.ty).toBeCloseTo(sm.spaceMouseAxis(0.5))
+  })
+
+  it('takes all six from one report on a puck that sends them together', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    dev.send(1, 350, 350, 350, 350, 350, 350)
+    tick()
+    const m = sm.readSpaceMouse({}, true)!
+    expect([m.tx, m.ty, m.tz, m.rx, m.ry, m.rz]).toEqual([-1, 1, 1, -1, 1, 1])
+  })
+
+  it('takes a puck whose reports stop as at rest', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    const view = {}
+    dev.send(1, 350, 0, 0)
+    tick()
+    expect(sm.readSpaceMouse(view, true)).not.toBeNull()
+    // Held still, it keeps reporting, and keeps flying.
+    tick(900)
+    dev.send(1, 350, 0, 0)
+    tick(900)
+    expect(sm.readSpaceMouse(view, true)).not.toBeNull()
+    // Silent past the limit — the zero reports lost — it stops.
+    tick(200)
+    expect(sm.readSpaceMouse(view, true)).toBeNull()
+  })
+
+  it('ignores a deflected puck in an unfocused window', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    dev.send(1, 350, 0, 0)
+    focused = false
+    tick()
+    expect(sm.readSpaceMouse({}, true)).toBeNull()
+  })
+
+  it('reads the gamepad when the browser shows the puck as one too', async () => {
+    const dev = compact()
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    const gp = { id: COMPACT_ID, index: 0, connected: true, axes: [1, 0, 0, 0, 0, 0] }
+    pads[0] = gp as unknown as Gamepad
+    fire('gamepadconnected', gp)
+    const view = {}
+    dev.send(1, 0, 350, 0)
+    tick()
+    const m = sm.readSpaceMouse(view, true)!
+    expect([m.tx, m.ty]).toEqual([-1, 0])
+    // Unplugged as a gamepad, WebHID carries on, without the gamepad's last axes.
+    gp.connected = false
+    fire('gamepaddisconnected', gp)
+    expect(sm.spaceMouseName()).toBe(COMPACT_ID)
+    tick()
+    expect(sm.readSpaceMouse(view, true)).toBeNull()
+    dev.send(1, 0, 350, 0)
+    tick()
+    expect(sm.readSpaceMouse(view, true)!.ty).toBe(1)
+  })
+
+  it('lets go when unplugged, telling its watchers, and takes it up again when it comes back', async () => {
+    const dev = compact()
+    granted = [dev]
+    const seen: (string | null)[] = []
+    sm.watchSpaceMouse(() => seen.push(sm.spaceMouseName()))
+    sm.listenForSpaceMouse()
+    await settle()
+    dev.send(1, 350, 0, 0)
+    granted = []
+    fireHid('disconnect', dev)
+    await settle()
+    expect(sm.spaceMouseAttached()).toBe(false)
+    expect(dev.reportListeners()).toBe(0)
+    tick()
+    expect(sm.readSpaceMouse({}, true)).toBeNull()
+    // Plugged back in, where the browser kept the grant.
+    const back = compact()
+    granted = [back]
+    fireHid('connect', back)
+    await settle()
+    expect(sm.spaceMouseAttached()).toBe(true)
+    expect(seen).toEqual([COMPACT_ID, null, COMPACT_ID])
+  })
+
+  it('opens and announces a puck once, however often it is offered', async () => {
+    const dev = compact()
+    granted = [dev, dev]
+    let told = 0
+    sm.watchSpaceMouse(() => told++)
+    sm.listenForSpaceMouse()
+    // Offered again while the first open is still under way.
+    fireHid('connect', dev)
+    await settle()
+    expect(dev.open).toHaveBeenCalledOnce()
+    expect(told).toBe(1)
+  })
+
+  it('asks for a puck only when told to, and says how it went', async () => {
+    sm.listenForSpaceMouse()
+    await settle()
+    expect(sm.spaceMouseAttached()).toBe(false)
+    expect(sm.spaceMouseHidAvailable()).toBe(true)
+    expect(await sm.connectSpaceMouseHid()).toBe('cancelled')
+    expect(requestDevice).toHaveBeenCalledWith({
+      filters: expect.arrayContaining([{ vendorId: 0x256f, usagePage: 1, usage: 8 }]),
+    })
+    picked = [compact()]
+    expect(await sm.connectSpaceMouseHid()).toBe('connected')
+    expect(sm.spaceMouseName()).toBe(COMPACT_ID)
+  })
+
+  it('says when the puck cannot be opened, as without the udev rule', async () => {
+    const dev = compact()
+    dev.openFails = true
+    picked = [dev]
+    expect(await sm.connectSpaceMouseHid()).toBe('failed')
+    expect(sm.spaceMouseAttached()).toBe(false)
+    expect(warn).toHaveBeenCalled()
+    // Found unasked at start, the same failure goes only to the console.
+    warn.mockClear()
+    vi.resetModules()
+    sm = await import('../src/viewer/spaceMouse')
+    granted = [dev]
+    sm.listenForSpaceMouse()
+    await settle()
+    expect(sm.spaceMouseAttached()).toBe(false)
+    expect(warn).toHaveBeenCalledOnce()
+  })
+})
+
 /** The navigator flying a camera from puck motion, on a stub canvas: an
  *  800 × 600 viewport looking down −Z at a unit cube, two millimetres of it
  *  tall on screen. */
