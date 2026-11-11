@@ -407,9 +407,17 @@ the same. Two things to know:
   ```
 
   then run `udevadm control --reload-rules && udevadm trigger` and plug the
-  puck in again. `256f` is 3Dconnexion's vendor id; an older puck sold
-  under Logitech's name has `046d`, and a second line with that id covers
-  it.
+  puck in again. `256f` is 3Dconnexion's vendor id. An older puck sold
+  under Logitech's name has Logitech's, `046d`, and needs a second line:
+
+  ```
+  KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c6*", TAG+="uaccess"
+  ```
+
+  It names the product ids as well because `046d` is on every Logitech
+  device — mice, keyboards, receivers — and the vendor alone would open all
+  of them to the browser. The SpaceMouse products are the ones whose id
+  starts with `c6`, the same pattern the app looks for.
 - A puck without a serial number, the SpaceMouse Compact among them, has to
   be connected again with the button each time it is plugged back in or the
   browser restarted: Chrome cannot tell it is the same device, so it does
